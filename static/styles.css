@@ -161,5 +161,6 @@ input[type="range"]:disabled { opacity: .5; }
   .record-art { right: -86px; opacity: .52; }
   .primary-button { padding-inline: 9px; }
   .primary-button svg { display: none; }
+  .section-heading { flex-wrap: wrap; }
   .section-heading > div:first-child { gap: 3px 7px; }
 }

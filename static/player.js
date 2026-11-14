@@ -10,7 +10,8 @@ const modeButtons = document.querySelectorAll("[data-mode]");
 let tracks = [];
 let queue = [];
 let currentId = null;
-let mode = localStorage.getItem("playbackMode") === "shuffle" ? "shuffle" : "ordered";
+const savedMode = localStorage.getItem("playbackMode");
+let mode = Array.from(modeButtons).some((button) => button.dataset.mode === savedMode) ? savedMode : "ordered";
 
 function icon(name) {
   const namespace = "http://www.w3.org/2000/svg";
@@ -76,7 +77,7 @@ function shuffled(ids) {
 
 function rebuildQueue(firstId = null) {
   const ids = tracks.map((track) => track.id);
-  if (mode === "ordered") {
+  if (mode !== "shuffle") {
     queue = ids;
     return;
   }
@@ -182,7 +183,7 @@ function selectTrack(id, autoplay = false) {
 
 async function refreshTracks() {
   tracks = await api("/api/tracks");
-  if (mode === "ordered" || queue.length === 0) {
+  if (mode !== "shuffle" || queue.length === 0) {
     rebuildQueue();
   } else {
     const ids = new Set(tracks.map((track) => track.id));
@@ -299,6 +300,7 @@ byId("import-form").addEventListener("submit", async (event) => {
 });
 
 function renderMode() {
+  audio.loop = mode === "repeat-one";
   for (const button of modeButtons) {
     button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
   }
