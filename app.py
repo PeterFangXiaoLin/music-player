@@ -150,6 +150,8 @@ def create_app(data_dir=ROOT / "data"):
         return closing(connection)
 
     with database() as connection, connection:
+        # Check and upgrade older libraries under the same write transaction.
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute("""
             CREATE TABLE IF NOT EXISTS tracks (
                 id TEXT PRIMARY KEY,
@@ -159,14 +161,23 @@ def create_app(data_dir=ROOT / "data"):
                 artist TEXT NOT NULL,
                 duration REAL NOT NULL,
                 cover TEXT NOT NULL,
-                file TEXT NOT NULL
+                file TEXT NOT NULL,
+                sort_position INTEGER
             )
         """)
+        columns = {column["name"] for column in connection.execute("PRAGMA table_info(tracks)")}
+        if "sort_position" not in columns:
+            connection.execute("ALTER TABLE tracks ADD COLUMN sort_position INTEGER")
+
+    def ordered_tracks(connection):
+        # Tracks without a saved position follow the sorted tracks in import order.
+        return connection.execute("SELECT * FROM tracks ORDER BY sort_position NULLS LAST, rowid")
 
     def public_track(row):
         track = dict(row)
         track.pop("file")
         track.pop("source_id")
+        track.pop("sort_position")
         track["audio"] = f"/audio/{quote(track['id'])}"
         return track
 
@@ -219,7 +230,33 @@ def create_app(data_dir=ROOT / "data"):
     @app.get("/api/tracks")
     def tracks():
         with database() as connection:
-            return jsonify([public_track(row) for row in connection.execute("SELECT * FROM tracks ORDER BY rowid")])
+            return jsonify([public_track(row) for row in ordered_tracks(connection)])
+
+    @app.put("/api/tracks/<track_id>/position")
+    def set_track_position(track_id):
+        payload = request.get_json(silent=True)
+        position = payload.get("position") if isinstance(payload, dict) else None
+        if type(position) is not int or position < 1:
+            return jsonify(error="歌曲位置必须为正整数。"), 400
+
+        with database() as connection, connection:
+            # Serialize reordering with imports and deletions so positions use the latest library.
+            connection.execute("BEGIN IMMEDIATE")
+            track_ids = [row["id"] for row in ordered_tracks(connection)]
+            if track_id not in track_ids:
+                return jsonify(error="歌曲已不在播放列表中。"), 404
+            if position > len(track_ids):
+                return jsonify(error="歌曲位置超出播放列表范围。"), 400
+
+            current_index = track_ids.index(track_id)
+            if current_index != position - 1:
+                track_ids.pop(current_index)
+                track_ids.insert(position - 1, track_id)
+                connection.executemany(
+                    "UPDATE tracks SET sort_position = ? WHERE id = ? AND sort_position IS NOT ?",
+                    ((index, song_id, index) for index, song_id in enumerate(track_ids)),
+                )
+        return "", 204
 
     @app.get("/api/import")
     def import_status():

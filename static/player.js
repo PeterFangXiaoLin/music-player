@@ -10,6 +10,8 @@ const modeButtons = document.querySelectorAll("[data-mode]");
 let tracks = [];
 let queue = [];
 let currentId = null;
+let movingTrack = false;
+let libraryRequest = 0;
 const savedMode = localStorage.getItem("playbackMode");
 let mode = Array.from(modeButtons).some((button) => button.dataset.mode === savedMode) ? savedMode : "ordered";
 
@@ -108,6 +110,19 @@ function renderLibrary() {
     });
 
     const actions = textElement("div", "track-actions", "");
+    for (const [direction, offset, label] of [["up", -1, "上移"], ["down", 1, "下移"]]) {
+      const targetIndex = index + offset;
+      const move = textElement("button", "icon-button", "");
+      move.type = "button";
+      move.dataset.move = direction;
+      move.title = label;
+      move.disabled = targetIndex < 0 || targetIndex >= tracks.length;
+      move.setAttribute("aria-label", `${label}：${track.title}`);
+      move.append(icon(direction));
+      move.addEventListener("click", () => changeTrackPosition(track, targetIndex + 1));
+      actions.append(move);
+    }
+
     const source = textElement("a", "icon-button", "");
     source.href = track.source;
     source.target = "_blank";
@@ -182,7 +197,11 @@ function selectTrack(id, autoplay = false) {
 }
 
 async function refreshTracks() {
-  tracks = await api("/api/tracks");
+  const requestId = ++libraryRequest;
+  const updatedTracks = await api("/api/tracks");
+  if (requestId !== libraryRequest) return;
+
+  tracks = updatedTracks;
   if (mode !== "shuffle" || queue.length === 0) {
     rebuildQueue();
   } else {
@@ -192,7 +211,15 @@ async function refreshTracks() {
     queue.push(...shuffled([...ids].filter((id) => !queued.has(id))));
   }
 
+  const focusedMove = document.activeElement.closest(".track button[data-move]");
+  const focusedTrackId = focusedMove?.closest(".track").dataset.id;
   renderLibrary();
+  if (focusedMove) {
+    const row = list.querySelector(`.track[data-id="${CSS.escape(focusedTrackId)}"]`);
+    const button = row?.querySelector(`[data-move="${focusedMove.dataset.move}"]:enabled`)
+      ?? row?.querySelector("[data-move]:enabled") ?? row?.querySelector(".track-name");
+    button?.focus();
+  }
   if (currentId && queue.includes(currentId)) {
     updateControls();
   } else {
@@ -225,6 +252,24 @@ function moveTrack(offset) {
   const position = queue.indexOf(currentId);
   const target = position >= 0 ? queue[position + offset] : null;
   if (target) selectTrack(target, true);
+}
+
+async function changeTrackPosition(track, position) {
+  if (movingTrack) return;
+  movingTrack = true;
+  try {
+    await api(`/api/tracks/${track.id}/position`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ position }),
+    });
+    await refreshTracks();
+    byId("order-status").textContent = `「${track.title}」已移到第 ${position} 位。`;
+  } catch (error) {
+    showStatus("player-status", `无法调整歌曲位置。${error.message}`, "error");
+  } finally {
+    movingTrack = false;
+  }
 }
 
 async function removeTrack(track, button) {

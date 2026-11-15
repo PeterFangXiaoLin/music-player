@@ -1,6 +1,8 @@
+import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 from urllib.request import Request
@@ -97,6 +99,49 @@ class LibraryTests(unittest.TestCase):
         with patch.object(type(audio), "unlink", side_effect=[busy, None]) as unlink:
             unlink_audio(audio)
         self.assertEqual(unlink.call_count, 2)
+
+    def test_reorder_preserves_existing_library_and_appends_imports(self):
+        with closing(sqlite3.connect(self.folder / "library.sqlite3")) as connection, connection:
+            # Recreate the schema used before saved ordering was supported.
+            connection.execute("DROP TABLE tracks")
+            connection.execute("""
+                CREATE TABLE tracks (
+                    id TEXT PRIMARY KEY, source_id TEXT UNIQUE, source TEXT UNIQUE,
+                    title TEXT, artist TEXT, duration REAL, cover TEXT, file TEXT
+                )
+            """)
+            connection.executemany("INSERT INTO tracks VALUES (?, ?, ?, ?, '', 0, '', ?)", (
+                (song_id, song_id, f"test:{song_id}", song_id, f"{song_id}.m4a")
+                for song_id in ("third", "first", "second")
+            ))
+        self.client = create_app(self.folder).test_client()
+
+        def track_ids():
+            return [track["id"] for track in self.client.get("/api/tracks").json]
+
+        def download(url, destination, progress):
+            path = destination / "track.m4a"
+            path.write_bytes(b"audio fixture")
+            return dict(source_id="new", source=url, title="新歌", artist="测试", duration=2, cover=""), path
+
+        self.assertEqual(track_ids(), ["third", "first", "second"])
+        self.assertEqual(self.client.put("/api/tracks/second/position", json={"position": 1}).status_code, 204)
+        self.assertEqual(self.client.put("/api/tracks/third/position", json={"position": 3}).status_code, 204)
+        self.client = create_app(self.folder).test_client()
+        self.assertEqual(track_ids(), ["second", "first", "third"])
+        self.assertEqual(self.client.put("/api/tracks/missing/position", json={"position": 1}).status_code, 404)
+        for invalid_position in (True, 0, 4, "2"):
+            with self.subTest(position=invalid_position):
+                response = self.client.put("/api/tracks/first/position", json={"position": invalid_position})
+                self.assertEqual(response.status_code, 400)
+        self.assertEqual(track_ids(), ["second", "first", "third"])
+
+        self.assertEqual(self.client.delete("/api/tracks/first").status_code, 204)
+        with patch("app.download_track", side_effect=download):
+            self.assertEqual(self.client.post("/api/import", json={"url": VIDEO}).status_code, 202)
+            job = self.wait_for_import()
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(track_ids(), ["second", "third", job["trackId"]])
 
 
 if __name__ == "__main__":
