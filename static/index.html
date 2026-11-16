@@ -48,7 +48,7 @@
         <section class="hero" aria-labelledby="page-title">
           <div class="hero-text">
             <h1 id="page-title">我的歌单</h1>
-            <p>把喜欢的 B 站视频，变成随时能听的音乐。</p>
+            <p>把喜欢的 B 站和 YouTube 视频收藏为音乐。</p>
           </div>
           <div class="record-art" aria-hidden="true">
             <div class="record-sleeve"></div>
@@ -59,11 +59,11 @@
         <section class="import-card" aria-labelledby="import-title">
           <div class="import-heading">
             <div class="import-icon"><svg><use href="#i-link"/></svg></div>
-            <div><h2 id="import-title">导入 B 站视频</h2><p id="import-hint">支持视频链接和 b23.tv 短链接</p></div>
+            <div><h2 id="import-title">导入视频音频</h2><p id="import-hint">支持 B 站、YouTube 和分享短链接</p></div>
           </div>
           <form id="import-form">
-            <label class="sr-only" for="video-url">B 站视频链接</label>
-            <input id="video-url" type="text" maxlength="2048" placeholder="粘贴 B 站视频链接" aria-describedby="import-hint" autocomplete="off" spellcheck="false" required>
+            <label class="sr-only" for="video-url">视频链接</label>
+            <input id="video-url" type="text" maxlength="2048" placeholder="粘贴视频链接" aria-describedby="import-hint" autocomplete="off" spellcheck="false" required>
             <button id="import-button" class="primary-button" type="submit"><svg><use href="#i-plus"/></svg><span>导入音频</span></button>
           </form>
           <p id="import-status" class="status" role="status" hidden></p>
@@ -79,12 +79,12 @@
             </div>
           </div>
           <div class="track-panel">
-            <div class="track-header" aria-hidden="true"><span>#</span><span>歌曲</span><span>UP 主</span><span><svg><use href="#i-clock"/></svg></span><span></span></div>
+            <div class="track-header" aria-hidden="true"><span>#</span><span>歌曲</span><span>发布者</span><span><svg><use href="#i-clock"/></svg></span><span></span></div>
             <ol id="track-list" class="track-list" aria-label="歌曲" hidden></ol>
             <div id="empty-state" class="empty-state">
               <span class="empty-icon"><svg><use href="#i-music"/></svg></span>
               <h3>歌单还是空的</h3>
-              <p>粘贴一个 B 站视频链接，添加你的第一首歌。</p>
+              <p>粘贴一个视频链接，添加你的第一首歌。</p>
             </div>
           </div>
           <p id="order-status" class="sr-only" role="status"></p>

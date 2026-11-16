@@ -6,7 +6,10 @@ import threading
 import time
 import webbrowser
 from contextlib import closing
+from importlib.util import find_spec
+from io import StringIO
 from pathlib import Path
+from shutil import which
 from tempfile import TemporaryDirectory
 from urllib.error import URLError
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
@@ -23,12 +26,37 @@ ROOT = Path(__file__).resolve().parent
 VIDEO_PATH = re.compile(r"/video/(BV[0-9A-Za-z]{10}|av[0-9]+)/?")
 VIDEO_HOSTS = {"www.bilibili.com", "bilibili.com", "m.bilibili.com"}
 SHORT_PATH = re.compile(r"/[0-9A-Za-z]+/?")
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
+YOUTUBE_WATCH_URL = "https://www.youtube.com/watch?v="
+YOUTUBE_ID = re.compile(r"[0-9A-Za-z_-]{11}")
+YOUTUBE_COOKIE_FILE = "youtube-cookies.txt"
+YOUTUBE_COOKIE_ROW = re.compile(
+    r"(?:#HttpOnly_)?(?P<domain>\.?(?:[A-Za-z0-9-]+\.)*youtube\.com)\t(?P<subdomains>TRUE|FALSE)"
+    r"\t/[^\t]*\t(?:TRUE|FALSE)\t[0-9]{0,15}\t[^\t]+\t[^\t]*",
+    re.ASCII | re.IGNORECASE,
+)
 MAX_AUDIO_SIZE = 200 * 1024 * 1024
 AUDIO_TYPES = {".m4a": "audio/mp4", ".webm": "audio/webm"}
 
 
 class ImportFailure(Exception):
     pass
+
+
+def youtube_video_id(link):
+    path = link.path.removesuffix("/")
+    if link.hostname == "youtu.be":
+        video_id = path.removeprefix("/")
+    elif link.hostname in YOUTUBE_HOSTS:
+        if path == "/watch":
+            video_id = parse_qs(link.query).get("v", [""])[0]
+        else:
+            match = re.fullmatch(r"/(?:shorts|live|embed)/([^/]+)", path)
+            video_id = match[1] if match else ""
+    else:
+        return None
+
+    return video_id if YOUTUBE_ID.fullmatch(video_id) else None
 
 
 def parse_link(value):
@@ -44,10 +72,14 @@ def parse_link(value):
                 if re.fullmatch(r"[1-9][0-9]{0,5}", page):
                     return f"https://www.bilibili.com/video/{video[1]}/?p={page}", False
                 raise ImportFailure("视频分 P 参数无效，请重新复制视频链接。")
+
+            video_id = youtube_video_id(link)
+            if video_id:
+                return YOUTUBE_WATCH_URL + video_id, False
     except ValueError:
         pass
 
-    raise ImportFailure("请输入 B 站视频链接（bilibili.com/video/… 或 b23.tv 短链接）。")
+    raise ImportFailure("请输入 B 站或 YouTube 的单个视频链接。")
 
 
 class ResolvedVideo(Exception):
@@ -59,6 +91,8 @@ class BilibiliRedirects(HTTPRedirectHandler):
         # Validate every redirect before opening it, since the original URL came from the user.
         try:
             target, is_short = parse_link(urljoin(req.full_url, newurl))
+            if target.startswith(YOUTUBE_WATCH_URL):
+                raise ImportFailure("该 B 站短链接没有指向 B 站视频，请粘贴原视频链接。")
             if not is_short:
                 raise ResolvedVideo(target)
         except (ImportFailure, ResolvedVideo):
@@ -77,7 +111,50 @@ def resolve_short_link(url):
         raise ImportFailure("无法打开短链接，请检查网络或粘贴完整视频链接。") from error
 
 
-def download_track(url, destination, report):
+def load_youtube_cookies(path):
+    max_size = 1024 * 1024
+    try:
+        with path.open("rb") as file:
+            contents = file.read(max_size + 1)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ImportFailure("无法读取 YouTube 登录文件，请检查文件权限。") from None
+
+    if len(contents) > max_size:
+        raise ImportFailure("YouTube 登录文件过大，请只导出 youtube.com 的 Cookie。")
+    try:
+        lines = contents.decode("utf-8-sig").splitlines()
+    except UnicodeError:
+        raise ImportFailure("YouTube 登录文件格式有误，请重新导出 Netscape 格式的 Cookie。") from None
+
+    # Pass only valid YouTube entries to yt-dlp so malformed lines cannot log session values.
+    cookies = []
+    for line in lines:
+        match = YOUTUBE_COOKIE_ROW.fullmatch(line)
+        if match and match["domain"].startswith(".") == (match["subdomains"] == "TRUE"):
+            cookies.append(line)
+    if not cookies:
+        raise ImportFailure("登录文件中没有可用的 YouTube Cookie，请重新导出 Netscape 格式的 Cookie。")
+
+    # yt-dlp saves its updated jar on exit. A memory stream keeps the user's file intact.
+    return StringIO("# Netscape HTTP Cookie File\n" + "\n".join(cookies) + "\n")
+
+
+def youtube_import_error(error, using_cookies):
+    message = str(error).lower()
+    if "private video" in message or "video is private" in message or "members-only" in message:
+        return "此 YouTube 视频需要账号访问权限。请确认当前账号能播放，再按 README 配置或更新登录文件。"
+    if "sign in" in message or "login required" in message:
+        if using_cookies:
+            return "YouTube 仍要求登录验证。请在浏览器中确认当前账号能播放该视频，再重新导出登录文件。"
+        return "YouTube 要求登录验证。请在浏览器中完成登录，按 README 将登录文件保存到 data/youtube-cookies.txt，再重新导入。"
+    if "429" in message or "too many requests" in message:
+        return "YouTube 限制了当前网络的请求（HTTP 429），请稍后重试。"
+    return "YouTube 导入失败，请在浏览器中确认该视频能正常播放，并检查播放器的网络连接。"
+
+
+def download_track(url, destination, report, *, cookie_path):
     def progress(event):
         if event.get("status") == "downloading":
             total = event.get("total_bytes") or event.get("total_bytes_estimate")
@@ -99,24 +176,46 @@ def download_track(url, destination, report):
         "max_filesize": MAX_AUDIO_SIZE,
         "progress_hooks": [progress],
     }
+    is_youtube = url.startswith(YOUTUBE_WATCH_URL)
+    extractor = "Youtube" if is_youtube else "BiliBili"
+    platform = "YouTube" if is_youtube else "B 站"
+    if is_youtube:
+        if find_spec("yt_dlp_ejs") is None:
+            raise ImportFailure("缺少 YouTube 解析组件，请通过 start.bat 重启以安装依赖。")
+        if not (which("deno") or which("node")):
+            raise ImportFailure("解析 YouTube 需要 Node.js 22+ 或 Deno 2.3+，安装后请重启播放器。")
+
+        def check_live(info, *, incomplete):
+            if info.get("live_status") in {"is_live", "is_upcoming", "post_live"}:
+                raise ImportFailure("请等 YouTube 直播回放处理完毕后再导入。")
+
+        options.update(js_runtimes={"deno": {}, "node": {}}, match_filter=check_live)
+        cookies = load_youtube_cookies(cookie_path)
+        if cookies is not None:
+            options["cookiefile"] = cookies
+
     try:
         with YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, ie_key="BiliBili", download=True)
+            info = downloader.extract_info(url, ie_key=extractor, download=True)
     except DownloadError as error:
         if "Requested format is not available" in str(error):
             raise ImportFailure("此视频没有可直接播放的音轨，请尝试其他视频。") from error
-        raise ImportFailure("B 站导入失败，请确认视频可在未登录时播放，并检查网络后重试。") from error
+        message = youtube_import_error(error, "cookiefile" in options) if is_youtube else (
+            "B 站导入失败，请确认应用可访问该平台，且视频无需登录即可播放。"
+        )
+        raise ImportFailure(message) from error
 
-    audio = destination / f"track.{info['ext']}"
-    if audio.suffix not in AUDIO_TYPES or not audio.is_file() or not audio.stat().st_size:
+    suffix = f".{(info or {}).get('ext', '')}"
+    audio = destination / f"track{suffix}"
+    if suffix not in AUDIO_TYPES or not audio.is_file() or not audio.stat().st_size:
         raise ImportFailure("没有下载到音频，请确认视频可播放且音频小于 200 MB。")
 
-    # B站返回的 ID 会带上分 P 后缀，也能将 AV 和 BV 链接归到同一首歌。
+    # Keep existing Bilibili IDs for deduplication across AV/BV links and distinguish YouTube IDs.
     return {
-        "source_id": info["id"],
+        "source_id": f"youtube:{info['id']}" if is_youtube else info["id"],
         "source": url,
         "title": info.get("title") or "未命名音轨",
-        "artist": info.get("uploader") or "B 站",
+        "artist": info.get("uploader") or info.get("channel") or platform,
         "duration": info.get("duration") or 0,
         "cover": (info.get("thumbnail") or "").replace("http://", "https://", 1),
     }, audio
@@ -197,7 +296,10 @@ def create_app(data_dir=ROOT / "data"):
 
                 # Only move the completed audio into the library, and undo the move if saving fails.
                 with TemporaryDirectory(prefix="import-", dir=data_dir) as staging:
-                    track, audio = download_track(url, Path(staging), lambda percent: set_job(percent=percent))
+                    track, audio = download_track(
+                        url, Path(staging), lambda percent: set_job(percent=percent),
+                        cookie_path=data_dir / YOUTUBE_COOKIE_FILE,
+                    )
                     existing = connection.execute("SELECT id FROM tracks WHERE source_id = ?", (track["source_id"],)).fetchone()
                     if existing:
                         set_job(status="done", trackId=existing["id"], duplicate=True)
@@ -268,7 +370,7 @@ def create_app(data_dir=ROOT / "data"):
         payload = request.get_json(silent=True)
         value = payload.get("url") if isinstance(payload, dict) else None
         if not isinstance(value, str) or not value.strip():
-            return jsonify(error="请先粘贴 B 站视频链接。"), 400
+            return jsonify(error="请先粘贴 B 站或 YouTube 视频链接。"), 400
         try:
             url, is_short = parse_link(value.strip())
         except ImportFailure as error:
