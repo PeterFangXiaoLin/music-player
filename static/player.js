@@ -10,6 +10,8 @@ const modeButtons = document.querySelectorAll("[data-mode]");
 let tracks = [];
 let queue = [];
 let currentId = null;
+let pendingResumeTime = null;
+let playbackInitialized = false;
 let movingTrack = false;
 let libraryRequest = 0;
 const savedMode = localStorage.getItem("playbackMode");
@@ -177,9 +179,52 @@ function updateTime() {
   byId("duration").textContent = formatTime(duration);
 }
 
-function selectTrack(id, autoplay = false) {
+function readPlaybackPosition() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("playbackPosition"));
+    if (typeof saved?.trackId === "string" && Number.isFinite(saved.time) && saved.time >= 0) {
+      return saved;
+    }
+  } catch (error) {
+    console.warn("无法读取已保存的播放进度。", error);
+  }
+  return null;
+}
+
+function savePlaybackPosition() {
+  if (!playbackInitialized) return;
+
+  try {
+    if (currentId === null) {
+      localStorage.removeItem("playbackPosition");
+      return;
+    }
+
+    // Preserve the requested position while the new audio is still loading.
+    const time = pendingResumeTime ?? audio.currentTime;
+    if (Number.isFinite(time) && time >= 0) {
+      localStorage.setItem("playbackPosition", JSON.stringify({ trackId: currentId, time }));
+    }
+  } catch (error) {
+    showStatus("player-status", "无法保存播放进度，请检查浏览器的本地存储权限。", "error");
+  }
+}
+
+function restorePlaybackPosition() {
+  if (pendingResumeTime === null || !Number.isFinite(audio.duration)) return;
+
+  // Seeking needs metadata. Clamp the saved position if the audio duration has changed.
+  audio.currentTime = Math.min(pendingResumeTime, audio.duration);
+  pendingResumeTime = null;
+  updateTime();
+  savePlaybackPosition();
+}
+
+function selectTrack(id, autoplay = false, startTime = 0) {
   const track = tracks.find((item) => item.id === id);
   currentId = track?.id ?? null;
+  pendingResumeTime = track ? startTime : null;
+  playbackInitialized = true;
   audio.pause();
   if (track) {
     audio.src = track.audio;
@@ -193,10 +238,11 @@ function selectTrack(id, autoplay = false) {
   showStatus("player-status", "");
   updateControls();
   updateTime();
+  savePlaybackPosition();
   if (track && autoplay) playCurrent();
 }
 
-async function refreshTracks() {
+async function refreshTracks(restorePlayback = false) {
   const requestId = ++libraryRequest;
   const updatedTracks = await api("/api/tracks");
   if (requestId !== libraryRequest) return;
@@ -223,7 +269,10 @@ async function refreshTracks() {
   if (currentId && queue.includes(currentId)) {
     updateControls();
   } else {
-    selectTrack(queue[0]);
+    const saved = restorePlayback ? readPlaybackPosition() : null;
+    const savedTrack = tracks.find((track) => track.id === saved?.trackId);
+    if (savedTrack && mode === "shuffle") rebuildQueue(savedTrack.id);
+    selectTrack(savedTrack?.id ?? queue[0], false, savedTrack ? saved.time : 0);
   }
 }
 
@@ -367,7 +416,13 @@ byId("previous").addEventListener("click", () => moveTrack(-1));
 byId("next").addEventListener("click", () => moveTrack(1));
 audio.addEventListener("ended", () => moveTrack(1));
 for (const event of ["play", "pause", "ended"]) audio.addEventListener(event, updateControls);
+audio.addEventListener("loadedmetadata", restorePlaybackPosition);
 for (const event of ["loadedmetadata", "durationchange", "timeupdate", "emptied"]) audio.addEventListener(event, updateTime);
+for (const event of ["timeupdate", "pause", "seeked"]) audio.addEventListener(event, savePlaybackPosition);
+window.addEventListener("pagehide", savePlaybackPosition);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") savePlaybackPosition();
+});
 audio.addEventListener("error", () => {
   if (currentId) showStatus("player-status", "音频文件无法读取，请尝试重新导入。", "error");
 });
@@ -402,7 +457,7 @@ updateVolume();
 renderMode();
 setImportBusy(true);
 try {
-  await refreshTracks();
+  await refreshTracks(true);
   const job = await api("/api/import");
   if (job.status === "running") await watchImport(job);
 } catch (error) {
